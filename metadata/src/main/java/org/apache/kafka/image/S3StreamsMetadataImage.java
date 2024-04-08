@@ -95,7 +95,7 @@ public final class S3StreamsMetadataImage {
 
         // floor value < 0 means that all stream objects' ranges are greater than startOffset
         int streamObjectIndex = Math.max(0, stream.floorStreamObjectIndex(startOffset));
-        List<S3StreamObject> streamObjects = stream.getStreamObjects();
+        List<S3StreamObject> streamObjects = stream.getStreamObjects(); // 排序或者copy了一下
 
         int lastRangeIndex = -1;
         List<S3StreamSetObject> streamSetObjects = null;
@@ -106,10 +106,11 @@ public final class S3StreamsMetadataImage {
 
             // try to find consistent stream objects
             for (; streamObjectIndex < streamObjects.size(); streamObjectIndex++) {
-                S3StreamObject streamObject = streamObjects.get(streamObjectIndex);
+                S3StreamObject streamObject = streamObjects.get(streamObjectIndex); // 这个对象有一个startOffset和一个endOffset
                 if (streamObject.startOffset() != nextStartOffset) {
                     //noinspection StatementWithEmptyBody
                     if (objects.isEmpty() && streamObject.startOffset() <= nextStartOffset && streamObject.endOffset() > nextStartOffset) {
+                        // 在第一个对象的范围里
                         // it's the first object, we only need the stream object contains the nextStartOffset
                     } else if (streamObject.endOffset() <= nextStartOffset) {
                         // the stream object not match the requirement, move to the next stream object
@@ -135,7 +136,7 @@ public final class S3StreamsMetadataImage {
                 }
                 lastRangeIndex = rangeIndex;
                 RangeMetadata range = stream.getRanges().get(rangeIndex);
-                node = nodeStreamSetObjectMetadata.get(range.nodeId());
+                node = nodeStreamSetObjectMetadata.get(range.nodeId()); // 获取这个node的相关streamObjectSet的信息
                 if (node != null) {
                     streamSetObjects = node.orderList();
                     streamSetObjectIndex = node.floorStreamSetObjectIndex(streamId, nextStartOffset);
@@ -146,16 +147,22 @@ public final class S3StreamsMetadataImage {
 
             for (; streamSetObjectIndex < streamSetObjects.size(); streamSetObjectIndex++) {
                 S3StreamSetObject streamSetObject = streamSetObjects.get(streamSetObjectIndex);
+
+                // 查找这个对象里的stream的范围
                 StreamOffsetRange streamOffsetRange = search(streamSetObject.offsetRangeList(), streamId);
                 // skip the stream set object not containing the stream or the range is before the nextStartOffset
                 if (streamOffsetRange == null || streamOffsetRange.endOffset() <= nextStartOffset) {
                     continue;
                 }
+
+                // 正好在这个offset对齐 || 是第一个对象
                 if ((streamOffsetRange.startOffset() == nextStartOffset)
                         || (objects.isEmpty() && streamOffsetRange.startOffset() < nextStartOffset)) {
                     if (node != null) {
+                        // 这里记了一个cache
                         node.recordStreamSetObjectIndex(streamId, nextStartOffset, streamSetObjectIndex);
                     }
+                    // 获取到了这个streamSetObject的对象范围
                     objects.add(new S3ObjectMetadata(streamSetObject.objectId(), S3ObjectType.STREAM_SET, List.of(streamOffsetRange),
                             streamSetObject.dataTimeInMs()));
                     nextStartOffset = streamOffsetRange.endOffset();

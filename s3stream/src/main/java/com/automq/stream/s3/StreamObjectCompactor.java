@@ -66,7 +66,7 @@ public class StreamObjectCompactor {
         this.objectManager = objectManager;
         this.s3Operator = s3Operator;
         this.stream = stream;
-        this.maxStreamObjectSize = Math.min(maxStreamObjectSize, Writer.MAX_OBJECT_SIZE);
+        this.maxStreamObjectSize = Math.min(maxStreamObjectSize, Writer.MAX_OBJECT_SIZE); // 10gb , 5tb
         String logIdent = "[StreamObjectsCompactionTask streamId=" + stream.streamId() + "] ";
         this.s3ObjectLogger = S3ObjectLogger.logger(logIdent);
         this.dataBlockGroupSizeThreshold = dataBlockGroupSizeThreshold;
@@ -99,23 +99,24 @@ public class StreamObjectCompactor {
         }
     }
 
-    void compact0(boolean onlyCleanup) throws ExecutionException, InterruptedException {
+    void compact0(boolean onlyCleanup) throws ExecutionException, InterruptedException { // more log is needed
         long streamId = stream.streamId();
         long startOffset = stream.startOffset();
 
+        // 获取从0到最后的全部的object
         List<S3ObjectMetadata> objects = objectManager.getStreamObjects(stream.streamId(), 0L, stream.confirmOffset(), Integer.MAX_VALUE).get();
         List<S3ObjectMetadata> expiredObjects = new ArrayList<>(objects.size());
         List<S3ObjectMetadata> livingObjects = new ArrayList<>(objects.size());
         for (S3ObjectMetadata object : objects) {
             if (object.endOffset() <= startOffset) {
-                expiredObjects.add(object);
+                expiredObjects.add(object); // 过期的object
             } else {
                 livingObjects.add(object);
             }
         }
 
         // clean up the expired objects
-        if (!expiredObjects.isEmpty()) {
+        if (!expiredObjects.isEmpty()) { // 这里单纯把对象回收了
             List<Long> compactedObjectIds = expiredObjects.stream().map(S3ObjectMetadata::objectId).collect(Collectors.toList());
             int expiredObjectCount = compactedObjectIds.size();
             // limit the expired objects compaction step to EXPIRED_OBJECTS_CLEAN_UP_STEP
@@ -138,6 +139,7 @@ public class StreamObjectCompactor {
         }
 
         // compact the living objects
+        // 按照合并之后的大小进行进一步的合并
         List<List<S3ObjectMetadata>> objectGroups = group0(livingObjects, maxStreamObjectSize);
         for (List<S3ObjectMetadata> objectGroup : objectGroups) {
             // the object group is single object and there is no data block need to be removed.
@@ -175,7 +177,7 @@ public class StreamObjectCompactor {
             this.startOffset = startOffset;
             this.objectGroup = objectGroup;
             this.objectId = objectId;
-            this.dataBlockGroupSizeThreshold = dataBlockGroupSizeThreshold;
+            this.dataBlockGroupSizeThreshold = dataBlockGroupSizeThreshold; // 1MB
             this.s3Operator = s3Operator;
         }
 
@@ -186,18 +188,28 @@ public class StreamObjectCompactor {
             long compactedEndOffset = objectGroup.get(objectGroup.size() - 1).endOffset();
             List<Long> compactedObjectIds = new LinkedList<>();
             CompositeByteBuf indexes = ByteBufAlloc.compositeByteBuffer();
+
+
             Writer writer = s3Operator.writer(new Writer.Context(STREAM_OBJECT_COMPACTION_READ), ObjectUtils.genKey(0, objectId), ThrottleStrategy.THROTTLE_2);
             long groupStartOffset = -1L;
             long groupStartPosition = -1L;
             int groupSize = 0;
             int groupRecordCount = 0;
             DataBlockIndex lastIndex = null;
+
+
             for (S3ObjectMetadata object : objectGroup) {
+
+                // 读取这个对象
                 try (ObjectReader reader = new ObjectReader(object, s3Operator)) {
                     ObjectReader.BasicObjectInfo basicObjectInfo = reader.basicObjectInfo().get();
+
+                    // 这个index
                     ByteBuf subIndexes = ByteBufAlloc.byteBuffer(basicObjectInfo.indexBlock().count() * DataBlockIndex.BLOCK_INDEX_SIZE, STREAM_OBJECT_COMPACTION_WRITE);
                     Iterator<DataBlockIndex> it = basicObjectInfo.indexBlock().iterator();
                     long validDataBlockStartPosition = 0;
+
+                    // 构建出来一个新的index
                     while (it.hasNext()) {
                         DataBlockIndex dataBlock = it.next();
                         if (dataBlock.endOffset() <= startOffset) {
@@ -206,7 +218,7 @@ public class StreamObjectCompactor {
                             continue;
                         }
                         if (groupSize == 0 // the first data block
-                            || (long) groupSize + dataBlock.size() > dataBlockGroupSizeThreshold
+                            || (long) groupSize + dataBlock.size() > dataBlockGroupSizeThreshold // 相当于每1MB就构建一个index？
                             || (long) groupRecordCount + dataBlock.recordCount() > Integer.MAX_VALUE
                             || dataBlock.endOffset() - groupStartOffset > Integer.MAX_VALUE) {
                             if (groupSize != 0) {
@@ -223,12 +235,15 @@ public class StreamObjectCompactor {
                         nextBlockPosition += dataBlock.size();
                         lastIndex = dataBlock;
                     }
+
+                    // copyWrite
                     writer.copyWrite(ObjectUtils.genKey(0, object.objectId()), validDataBlockStartPosition, basicObjectInfo.dataBlockSize());
                     objectSize += basicObjectInfo.dataBlockSize() - validDataBlockStartPosition;
                     indexes.addComponent(true, subIndexes);
                     compactedObjectIds.add(object.objectId());
                 }
             }
+
             if (lastIndex != null) {
                 ByteBuf subIndexes = ByteBufAlloc.byteBuffer(DataBlockIndex.BLOCK_INDEX_SIZE, STREAM_OBJECT_COMPACTION_WRITE);
                 new DataBlockIndex(streamId, groupStartOffset, (int) (lastIndex.endOffset() - groupStartOffset),
@@ -236,6 +251,7 @@ public class StreamObjectCompactor {
                 indexes.addComponent(true, subIndexes);
             }
 
+            // 这里的index和最后的footer的part
             CompositeByteBuf indexBlockAndFooter = ByteBufAlloc.compositeByteBuffer();
             indexBlockAndFooter.addComponent(true, indexes);
             indexBlockAndFooter.addComponent(true, new ObjectWriter.Footer(nextBlockPosition, indexBlockAndFooter.readableBytes()).buffer());
@@ -256,8 +272,8 @@ public class StreamObjectCompactor {
         List<S3ObjectMetadata> group = new LinkedList<>();
         int partCount = 0;
         for (S3ObjectMetadata object : objects) {
-            int objectPartCount = (int) ((object.objectSize() + Writer.MAX_PART_SIZE - 1) / Writer.MAX_PART_SIZE);
-            if (objectPartCount >= Writer.MAX_PART_COUNT) {
+            int objectPartCount = (int) ((object.objectSize() + Writer.MAX_PART_SIZE - 1) / Writer.MAX_PART_SIZE); // 最大的一个part的大小 5gb
+            if (objectPartCount >= Writer.MAX_PART_COUNT) { // 最多的part 10000
                 continue;
             }
             if (groupNextOffset == -1L) {
@@ -266,9 +282,9 @@ public class StreamObjectCompactor {
             // group the objects when the object's range is continuous
             if (groupNextOffset != object.startOffset()
                 // the group object size is less than maxStreamObjectSize
-                || (groupSize + object.objectSize() > maxStreamObjectSize && !group.isEmpty())
+                || (groupSize + object.objectSize() > maxStreamObjectSize && !group.isEmpty()) // 可能是10g
                 // object count in a group is larger than MAX_OBJECT_GROUP_COUNT
-                || group.size() >= MAX_OBJECT_GROUP_COUNT
+                || group.size() >= MAX_OBJECT_GROUP_COUNT // 可能是5000
                 || partCount + objectPartCount > Writer.MAX_PART_COUNT
             ) {
                 objectGroups.add(group);

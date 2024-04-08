@@ -191,6 +191,7 @@ public class CompactionManager {
         }, compactThreadPool);
     }
 
+    // 表示这个流的开始和结束 + 每一个StreamSetObjects
     private void compact(List<StreamMetadata> streamMetadataList,
         List<S3ObjectMetadata> objectMetadataList) throws CompletionException {
         if (!running.get()) {
@@ -201,12 +202,17 @@ public class CompactionManager {
         if (objectMetadataList.isEmpty()) {
             return;
         }
+
+        // 按照是否forceSplit来进行区分
         Map<Boolean, List<S3ObjectMetadata>> objectMetadataFilterMap = convertS3Objects(objectMetadataList);
-        List<S3ObjectMetadata> objectsToForceSplit = objectMetadataFilterMap.get(true);
-        List<S3ObjectMetadata> objectsToCompact = objectMetadataFilterMap.get(false);
+        List<S3ObjectMetadata> objectsToForceSplit = objectMetadataFilterMap.get(true); // 需要强制split的，到了强制split的时间的
+        List<S3ObjectMetadata> objectsToCompact = objectMetadataFilterMap.get(false); // 需要做对象compact的
 
         long totalSize = objectsToForceSplit.stream().mapToLong(S3ObjectMetadata::objectSize).sum();
         totalSize += objectsToCompact.stream().mapToLong(S3ObjectMetadata::objectSize).sum();
+
+        // 计算一下Compact的限流bucket
+
         // throttle compaction read to half of compaction interval because of write overhead
         int expectCompleteTime = compactionInterval / 2;
         long expectReadBytesPerSec;
@@ -227,10 +233,13 @@ public class CompactionManager {
             compactionBucket = null;
         }
 
+        // 强制split的
         if (!objectsToForceSplit.isEmpty()) {
             // split stream set objects to seperated stream objects
             forceSplitObjects(streamMetadataList, objectsToForceSplit);
         }
+
+        // 需要做compact的？ streamSetObject为什么需要做Compact呢？
         // compact stream set objects
         compactObjects(streamMetadataList, objectsToCompact);
     }
@@ -249,6 +258,8 @@ public class CompactionManager {
                 objectToForceSplit.objectId(), objectToForceSplit.objectSize());
             CommitStreamSetObjectRequest request;
             try {
+                // 这个调用返回的时候，全部的对象都被拆分到目标对象里了
+                // 而且范围检查也通过了
                 request = buildSplitRequest(streamMetadataList, objectToForceSplit);
             } catch (Exception ex) {
                 logger.error("Build force split request for object {} failed, ex: ", objectToForceSplit.objectId(), ex);
@@ -260,6 +271,8 @@ public class CompactionManager {
             logger.info("Build force split request for object {} complete, generated {} stream objects, time cost: {} ms, start committing objects",
                 objectToForceSplit.objectId(), request.getStreamObjects().size(), timerUtil.elapsedAs(TimeUnit.MILLISECONDS));
             timerUtil.reset();
+
+            // 尝试commit这个对象同步的
             objectManager.commitStreamSetObject(request)
                 .thenAccept(resp -> {
                     logger.info("Commit force split request succeed, time cost: {} ms", timerUtil.elapsedAs(TimeUnit.MILLISECONDS));
@@ -268,6 +281,7 @@ public class CompactionManager {
                     }
                 })
                 .exceptionally(ex -> {
+                    // 如果compact失败的话不确定要如何处理
                     logger.error("Commit force split request failed, ex: ", ex);
                     return null;
                 })
@@ -284,6 +298,8 @@ public class CompactionManager {
         if (objectsToCompact.isEmpty()) {
             return;
         }
+
+        // 按照时间的降序排列
         // sort by S3 object data time in descending order
         objectsToCompact.sort((o1, o2) -> Long.compare(o2.dataTimeInMs(), o1.dataTimeInMs()));
         if (maxObjectNumToCompact < objectsToCompact.size()) {
@@ -379,6 +395,9 @@ public class CompactionManager {
             return false;
         }
 
+        // 获取这个对象里面全部（valid的）index列
+
+        // objectId -> List<StreamDataBlock> // (streamId, startOffset, endOffset, recordCount, blockPosition, blockSize)
         Map<Long, List<StreamDataBlock>> streamDataBlocksMap = CompactionUtils.blockWaitObjectIndices(streamMetadataList,
             Collections.singletonList(objectMetadata), s3Operator, logger);
         if (streamDataBlocksMap.isEmpty()) {
@@ -392,13 +411,17 @@ public class CompactionManager {
             return true;
         }
 
+        // 拆分这个对象的同时使用流式传输上传这个对象到新的object上，这里获取的是全部新生成的object对象
         cfs.addAll(groupAndSplitStreamDataBlocks(objectMetadata, streamDataBlocks));
         return true;
     }
 
+    // 这个object和对应的有效的index
     Collection<CompletableFuture<StreamObject>> groupAndSplitStreamDataBlocks(S3ObjectMetadata objectMetadata,
         List<StreamDataBlock> streamDataBlocks) {
         List<Pair<List<StreamDataBlock>, CompletableFuture<StreamObject>>> groupedDataBlocks = new ArrayList<>();
+
+        // 按照streamId和streamEndOffset 进行分组,streamId 和endOffset相同的会被聚合到一组里，否则会被分出来
         List<List<StreamDataBlock>> groupedStreamDataBlocks = CompactionUtils.groupStreamDataBlocks(streamDataBlocks, new GroupByOffsetPredicate());
         for (List<StreamDataBlock> group : groupedStreamDataBlocks) {
             groupedDataBlocks.add(new ImmutablePair<>(group, new CompletableFuture<>()));
@@ -409,6 +432,8 @@ public class CompactionManager {
         while (index < groupedDataBlocks.size()) {
             List<Pair<List<StreamDataBlock>, CompletableFuture<StreamObject>>> batchGroup = new ArrayList<>();
             long readSize = 0;
+
+            // 统计大小如果总和大于200MB的话则跳过加到下一组里
             while (index < groupedDataBlocks.size()) {
                 Pair<List<StreamDataBlock>, CompletableFuture<StreamObject>> group = groupedDataBlocks.get(index);
                 List<StreamDataBlock> groupedStreamDataBlock = group.getLeft();
@@ -425,18 +450,30 @@ public class CompactionManager {
                 logger.error("Force split object failed, not be able to read any data block, maybe compactionCacheSize is too small");
                 return new ArrayList<>();
             }
+
+
             // prepare N stream objects at one time
             objectManager.prepareObject(batchGroup.size(), TimeUnit.MINUTES.toMillis(CompactionConstants.S3_OBJECT_TTL_MINUTES))
                 .thenComposeAsync(objectId -> {
+                    // 这个分组的全部的数据分片
                     List<StreamDataBlock> blocksToRead = batchGroup.stream().flatMap(p -> p.getLeft().stream()).collect(Collectors.toList());
                     DataBlockReader reader = new DataBlockReader(objectMetadata, s3Operator, compactionBucket, bucketCallbackScheduledExecutor);
-                    // batch read
+                    // batch read、
+                    // 这里的读取会根据之前限制的bucket进行限流
                     reader.readBlocks(blocksToRead, Math.min(CompactionConstants.S3_OBJECT_MAX_READ_BATCH, networkBandwidth));
 
                     List<CompletableFuture<Void>> cfs = new ArrayList<>();
+
+                    // 这些块儿对应的最后生成的对象
                     for (Pair<List<StreamDataBlock>, CompletableFuture<StreamObject>> pair : batchGroup) {
+                        // 这个pair里都是对应的这个stream的连续的数据的
                         List<StreamDataBlock> blocks = pair.getLeft();
+
+                        // 这里是新申请的objectId
+
                         DataBlockWriter writer = new DataBlockWriter(objectId, s3Operator, config.objectPartSize());
+
+                        // 这里会根据每个block的读取的异步操作，完成之后就直接写到writer里
                         CompletableFuture<Void> cf = CompactionUtils.chainWriteDataBlock(writer, blocks, forceSplitThreadPool);
                         long finalObjectId = objectId;
                         cfs.add(cf.thenAccept(nil -> writer.close()).whenComplete((ret, ex) -> {
@@ -446,6 +483,8 @@ public class CompactionManager {
                                 blocks.forEach(StreamDataBlock::release);
                                 return;
                             }
+
+                            // 生成了一个新的连续的object
                             StreamObject streamObject = new StreamObject();
                             streamObject.setObjectId(finalObjectId);
                             streamObject.setStreamId(blocks.get(0).getStreamId());
@@ -473,6 +512,7 @@ public class CompactionManager {
     CommitStreamSetObjectRequest buildSplitRequest(List<StreamMetadata> streamMetadataList,
         S3ObjectMetadata objectToSplit) throws CompletionException {
         List<CompletableFuture<StreamObject>> cfs = new ArrayList<>();
+        // 尝试拆分这个对象
         boolean status = splitStreamSetObject(streamMetadataList, objectToSplit, cfs);
         if (!status) {
             logger.error("Force split object {} failed, no stream object generated", objectToSplit.objectId());
@@ -480,7 +520,7 @@ public class CompactionManager {
         }
 
         CommitStreamSetObjectRequest request = new CommitStreamSetObjectRequest();
-        request.setObjectId(-1L);
+        request.setObjectId(-1L); // TODO 这里应该是 NO_OP的对象标记
 
         // wait for all force split objects to complete
         synchronized (this) {
@@ -493,19 +533,19 @@ public class CompactionManager {
         try {
             forceSplitCf.join();
         } catch (CancellationException exception) {
-            logger.info("Force split objects cancelled");
+            logger.info("Force split objects cancelled"); // 这里可能会被取消
             return null;
         }
         forceSplitCf = null;
         cfs.stream().map(e -> {
             try {
                 return e.join();
-            } catch (Exception ignored) {
+            } catch (Exception ignored) { // 这里预期是全部完成的
                 return null;
             }
-        }).filter(Objects::nonNull).forEach(request::addStreamObject);
+        }).filter(Objects::nonNull).forEach(request::addStreamObject); // 塞到streamObject里了
 
-        request.setCompactedObjectIds(Collections.singletonList(objectToSplit.objectId()));
+        request.setCompactedObjectIds(Collections.singletonList(objectToSplit.objectId())); // 原始的对象会被回收
         if (isSanityCheckFailed(streamMetadataList, Collections.singletonList(objectToSplit), request)) {
             logger.error("Sanity check failed, force split result is illegal");
             return null;
@@ -523,18 +563,28 @@ public class CompactionManager {
         Set<Long> compactedObjectIds = new HashSet<>();
         logger.info("{} stream set objects as compact candidates, total compaction size: {}",
             objectsToCompact.size(), objectsToCompact.stream().mapToLong(S3ObjectMetadata::objectSize).sum());
+
+        // 获取全部的slice,这里是全部的block的对象，
+
+        // object -> 对应的block数据块儿
         Map<Long, List<StreamDataBlock>> streamDataBlockMap = CompactionUtils.blockWaitObjectIndices(streamMetadataList,
             objectsToCompact, s3Operator, logger);
+
+        // 确保每个数据块儿都不超过200MB
         for (List<StreamDataBlock> blocks : streamDataBlockMap.values()) {
             for (StreamDataBlock block : blocks) {
-                if (block.getBlockSize() > compactionCacheSize) {
+                if (block.getBlockSize() > compactionCacheSize) { // 这个确保不超过这个CompactCache的大小，200MB
                     logger.error("Block {} size exceeds compaction cache size {}, skip compaction", block, compactionCacheSize);
                     return null;
                 }
             }
         }
+
+
         long now = System.currentTimeMillis();
         Set<Long> excludedObjectIds = new HashSet<>();
+
+        //
         List<CompactionPlan> compactionPlans = this.compactionAnalyzer.analyze(streamDataBlockMap, excludedObjectIds);
         logger.info("Analyze compaction plans complete, cost {}ms", System.currentTimeMillis() - now);
         logCompactionPlans(compactionPlans, excludedObjectIds);
@@ -546,8 +596,10 @@ public class CompactionManager {
             return null;
         }
 
+        // 获取全部被干掉的objectId
         compactionPlans.forEach(c -> c.streamDataBlocksMap().values().forEach(v -> v.forEach(b -> compactedObjectIds.add(b.getObjectId()))));
 
+        // 直接干掉空的object块儿
         // compact out-dated objects directly
         streamDataBlockMap.entrySet().stream().filter(e -> e.getValue().isEmpty()).forEach(e -> {
             logger.info("Object {} is out of date, will be deleted after compaction", e.getKey());
@@ -555,6 +607,8 @@ public class CompactionManager {
         });
 
         request.setCompactedObjectIds(new ArrayList<>(compactedObjectIds));
+
+
         List<S3ObjectMetadata> compactedObjectMetadata = objectsToCompact.stream()
             .filter(e -> compactedObjectIds.contains(e.objectId())).collect(Collectors.toList());
         if (isSanityCheckFailed(streamMetadataList, compactedObjectMetadata, request)) {
@@ -567,38 +621,59 @@ public class CompactionManager {
 
     boolean isSanityCheckFailed(List<StreamMetadata> streamMetadataList, List<S3ObjectMetadata> compactedObjects,
         CommitStreamSetObjectRequest request) {
+
+        // streamId -> streamMeta
         Map<Long, StreamMetadata> streamMetadataMap = streamMetadataList.stream()
             .collect(Collectors.toMap(StreamMetadata::streamId, e -> e));
+
+        // objectId -> objectMeta
         Map<Long, S3ObjectMetadata> objectMetadataMap = compactedObjects.stream()
             .collect(Collectors.toMap(S3ObjectMetadata::objectId, e -> e));
 
+        // list<(streamId, startOffset, endOffset)>
         List<StreamOffsetRange> compactedStreamOffsetRanges = new ArrayList<>();
         request.getStreamRanges().forEach(o -> compactedStreamOffsetRanges.add(new StreamOffsetRange(o.getStreamId(), o.getStartOffset(), o.getEndOffset())));
         request.getStreamObjects().forEach(o -> compactedStreamOffsetRanges.add(new StreamOffsetRange(o.getStreamId(), o.getStartOffset(), o.getEndOffset())));
+
+        // 按照stream做groupBy
         Map<Long, List<StreamOffsetRange>> sortedStreamOffsetRanges = compactedStreamOffsetRanges.stream()
             .collect(Collectors.groupingBy(StreamOffsetRange::streamId));
+
         sortedStreamOffsetRanges.replaceAll((k, v) -> sortAndMerge(v));
+
+        // 对于每个要被干掉的object来说
         for (long objectId : request.getCompactedObjectIds()) {
-            S3ObjectMetadata metadata = objectMetadataMap.get(objectId);
+            S3ObjectMetadata metadata = objectMetadataMap.get(objectId); // 这个对象的元数据
+
+            // 这个object的数据范围
             for (StreamOffsetRange streamOffsetRange : metadata.getOffsetRanges()) {
-                if (!streamMetadataMap.containsKey(streamOffsetRange.streamId())) {
+                if (!streamMetadataMap.containsKey(streamOffsetRange.streamId())) { // 已经没有这个流了
                     // skip non-exist stream
                     continue;
                 }
+
+                // 获取这个流的开始的offset
                 long streamStartOffset = streamMetadataMap.get(streamOffsetRange.streamId()).startOffset();
                 if (streamOffsetRange.endOffset() <= streamStartOffset) {
                     // skip stream offset range that has been trimmed
                     continue;
                 }
+
+                // 获取正确的stream的范围
                 if (streamOffsetRange.startOffset() < streamStartOffset) {
                     // trim stream offset range
                     streamOffsetRange = new StreamOffsetRange(streamOffsetRange.streamId(), streamStartOffset, streamOffsetRange.endOffset());
                 }
+
+                // 排序之后某一段儿丢失了
                 if (!sortedStreamOffsetRanges.containsKey(streamOffsetRange.streamId())) {
                     logger.error("Sanity check failed, stream {} is missing after compact", streamOffsetRange.streamId());
                     return true;
                 }
+
                 boolean contained = false;
+
+                // compact之后这个stream的相关流的范围？这里预期应该正好在这个范围内？
                 for (StreamOffsetRange compactedStreamOffsetRange : sortedStreamOffsetRanges.get(streamOffsetRange.streamId())) {
                     if (streamOffsetRange.startOffset() >= compactedStreamOffsetRange.startOffset()
                         && streamOffsetRange.endOffset() <= compactedStreamOffsetRange.endOffset()) {
@@ -606,6 +681,7 @@ public class CompactionManager {
                         break;
                     }
                 }
+
                 if (!contained) {
                     logger.error("Sanity check failed, object {} offset range {} is missing after compact", objectId, streamOffsetRange);
                     return true;
@@ -621,7 +697,7 @@ public class CompactionManager {
             return streamOffsetRangeList;
         }
         long streamId = streamOffsetRangeList.get(0).streamId();
-        Collections.sort(streamOffsetRangeList);
+        Collections.sort(streamOffsetRangeList); // 按照stream排序，之后按照startOffset排序，之后按照endOffset排序
         List<StreamOffsetRange> mergedList = new ArrayList<>();
         long start = -1L;
         long end = -1L;
@@ -669,20 +745,25 @@ public class CompactionManager {
                 .mapToLong(StreamDataBlock::getBlockSize).sum();
             logger.info("Compaction progress {}/{}, read from {} stream set objects, total size: {}", i + 1, compactionPlans.size(),
                 compactionPlan.streamDataBlocksMap().size(), totalSize);
+
+
+            // 触发所有数据块儿的更换
             for (Map.Entry<Long, List<StreamDataBlock>> streamDataBlocEntry : compactionPlan.streamDataBlocksMap().entrySet()) {
                 S3ObjectMetadata metadata = s3ObjectMetadataMap.get(streamDataBlocEntry.getKey());
                 List<StreamDataBlock> streamDataBlocks = streamDataBlocEntry.getValue();
                 DataBlockReader reader = new DataBlockReader(metadata, s3Operator, compactionBucket, bucketCallbackScheduledExecutor);
                 reader.readBlocks(streamDataBlocks, Math.min(CompactionConstants.S3_OBJECT_MAX_READ_BATCH, networkBandwidth));
             }
+
+
             List<CompletableFuture<StreamObject>> streamObjectCfList = new ArrayList<>();
             CompletableFuture<Void> streamSetObjectChainWriteCf = CompletableFuture.completedFuture(null);
             for (CompactedObject compactedObject : compactionPlan.compactedObjects()) {
                 if (compactedObject.type() == CompactionType.COMPACT) {
-                    sortedStreamDataBlocks.addAll(compactedObject.streamDataBlocks());
+                    sortedStreamDataBlocks.addAll(compactedObject.streamDataBlocks()); // 这个类型任然是一个streamSetObject, 都写到这里面
                     streamSetObjectChainWriteCf = uploader.chainWriteStreamSetObject(streamSetObjectChainWriteCf, compactedObject);
                 } else {
-                    streamObjectCfList.add(uploader.writeStreamObject(compactedObject));
+                    streamObjectCfList.add(uploader.writeStreamObject(compactedObject)); // split类型会单独生成一个StreamObject
                 }
             }
 
@@ -696,7 +777,7 @@ public class CompactionManager {
                 }
                 // wait for all stream objects and stream set object part to be uploaded
                 compactionCf = CompletableFuture.allOf(cfList.toArray(new CompletableFuture[0]))
-                    .thenCompose(v -> uploader.forceUploadStreamSetObject())
+                    .thenCompose(v -> uploader.forceUploadStreamSetObject()) // 触发强制上传
                     .exceptionally(ex -> {
                         uploader.release().thenAccept(v -> {
                             for (CompactedObject compactedObject : compactionPlan.compactedObjects()) {
@@ -728,6 +809,8 @@ public class CompactionManager {
                 }
             }
         }
+
+        // 按照stream和range拆分
         List<ObjectStreamRange> objectStreamRanges = CompactionUtils.buildObjectStreamRangeFromGroup(
             CompactionUtils.groupStreamDataBlocks(sortedStreamDataBlocks, new GroupByOffsetPredicate()));
         objectStreamRanges.forEach(request::addStreamRange);

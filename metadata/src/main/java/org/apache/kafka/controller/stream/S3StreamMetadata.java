@@ -42,7 +42,7 @@ public class S3StreamMetadata {
     private final TimelineLong startOffset;
     private final TimelineObject<StreamState> currentState;
     private final TimelineHashMap<Integer/*rangeIndex*/, RangeMetadata> ranges;
-    private final TimelineHashMap<Long/*objectId*/, S3StreamObject> streamObjects;
+    private final TimelineHashMap<Long/*objectId*/, S3StreamObject> streamObjects; // 这个streamObject没有了
 
     public S3StreamMetadata(long currentEpoch, int currentRangeIndex, long startOffset,
                             StreamState currentState, SnapshotRegistry registry) {

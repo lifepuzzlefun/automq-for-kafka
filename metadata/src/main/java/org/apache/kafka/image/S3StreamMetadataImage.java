@@ -154,8 +154,8 @@ public class S3StreamMetadataImage {
     }
 
     public int floorStreamObjectIndex(long offset) {
-        List<S3StreamObject> sortedStreamObjects = getStreamObjects();
-        if (streamObjectOffsets == null) {
+        List<S3StreamObject> sortedStreamObjects = getStreamObjects(); // 全部的单个对象的object
+        if (streamObjectOffsets == null) { // 这里创建了一个treeMap 所以不是并发安全的
             // TODO: optimize, get floor index without construct sorted map
             NavigableMap<Long, Integer> streamObjectOffsets = new TreeMap<>();
             for (int i = 0; i < sortedStreamObjects.size(); i++) {
@@ -164,7 +164,7 @@ public class S3StreamMetadataImage {
             }
             this.streamObjectOffsets = streamObjectOffsets;
         }
-        Map.Entry<Long, Integer> entry = streamObjectOffsets.floorEntry(offset);
+        Map.Entry<Long, Integer> entry = streamObjectOffsets.floorEntry(offset); // >= offset的entry
         if (entry == null) {
             return -1;
         }

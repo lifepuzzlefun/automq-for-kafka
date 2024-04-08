@@ -121,7 +121,7 @@ public class S3StreamClient implements StreamClient {
     private void startStreamObjectsCompactions() {
         scheduledCompactionTaskFuture = streamObjectCompactionScheduler.scheduleWithFixedDelay(() -> {
             List<StreamWrapper> operationStreams = new ArrayList<>(openedStreams.values());
-            operationStreams.forEach(StreamWrapper::compactStreamObject);
+            operationStreams.forEach(StreamWrapper::compactStreamObject); // 这里是全部打开的stream都会进行compaction
         }, config.streamObjectCompactionIntervalMinutes(), config.streamObjectCompactionIntervalMinutes(), TimeUnit.MINUTES);
     }
 

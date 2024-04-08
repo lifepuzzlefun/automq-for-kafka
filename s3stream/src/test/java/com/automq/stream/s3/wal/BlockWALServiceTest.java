@@ -896,6 +896,7 @@ class BlockWALServiceTest {
 
         long position = WALUtil.recordOffsetToPosition(logicOffset, walChannel.capacity(), WAL_HEADER_TOTAL_CAPACITY);
         walChannel.writeAndFlush(record, position);
+        record.release();
     }
 
     private void writeWALHeader(WALChannel walChannel, long trimOffset, long maxLength) throws IOException {

@@ -86,10 +86,12 @@ public class CompactionAnalyzer {
         CompactionStats stats = null;
         int streamNumInStreamSet = -1;
         int streamObjectNum = -1;
+
+
         do {
             final Set<Long> objectsToRemove = new HashSet<>();
             if (stats != null) {
-                if (streamObjectNum > maxStreamObjectNum) {
+                if (streamObjectNum > maxStreamObjectNum) { // 如果超过了拆分的streamObject的数量
                     logger.warn("Stream object num {} exceeds limit {}, try to reduce number of objects to compact", streamObjectNum, maxStreamObjectNum);
                     addObjectsToRemove(CompactionType.SPLIT, compactedObjectBuilders, stats, objectsToRemove);
                 } else {
@@ -107,11 +109,15 @@ public class CompactionAnalyzer {
             }
             sortedStreamDataBlocks.removeIf(e -> objectsToRemove.contains(e.getObjectId()));
             objectsToRemove.forEach(streamDataBlockMap::remove);
+
+
             streamDataBlockMap = filterBlocksToCompact(streamDataBlockMap);
             if (streamDataBlockMap.isEmpty()) {
                 logger.warn("No viable objects to compact after exclusion");
                 return new ArrayList<>();
             }
+
+
             compactedObjectBuilders = compactObjects(sortedStreamDataBlocks);
             stats = CompactionStats.of(compactedObjectBuilders);
             streamNumInStreamSet = stats.getStreamRecord().streamNumInStreamSet();
@@ -189,11 +195,14 @@ public class CompactionAnalyzer {
     List<CompactionPlan> generatePlanWithCacheLimit(List<CompactedObjectBuilder> compactedObjectBuilders) {
         List<CompactionPlan> compactionPlans = new ArrayList<>();
         List<CompactedObject> compactedObjects = new ArrayList<>();
+
         CompactedObjectBuilder compactedStreamSetObjectBuilder = null;
         long totalSize = 0L;
         int compactionOrder = 0;
         for (int i = 0; i < compactedObjectBuilders.size(); ) {
             CompactedObjectBuilder compactedObjectBuilder = compactedObjectBuilders.get(i);
+
+            // 判断一下总的blockSize + 这个块儿的话是否超过了CompactionCache的大小
             if (totalSize + compactedObjectBuilder.totalBlockSize() > compactionCacheSize) {
                 if (shouldSplitObject(compactedObjectBuilder)) {
                     // split object to fit into cache
@@ -206,7 +215,7 @@ public class CompactionAnalyzer {
                             break;
                         }
                     }
-                    if (endOffset != 0) {
+                    if (endOffset != 0) { // 这里生成了两个builder
                         CompactedObjectBuilder builder = compactedObjectBuilder.split(0, endOffset);
                         compactedStreamSetObjectBuilder = addOrMergeCompactedObject(builder, compactedObjects, compactedStreamSetObjectBuilder);
                     }
@@ -232,13 +241,13 @@ public class CompactionAnalyzer {
     private CompactedObjectBuilder addOrMergeCompactedObject(CompactedObjectBuilder compactedObjectBuilder,
         List<CompactedObject> compactedObjects,
         CompactedObjectBuilder compactedStreamSetObjectBuilder) {
-        if (compactedObjectBuilder.type() == CompactionType.SPLIT) {
+        if (compactedObjectBuilder.type() == CompactionType.SPLIT) { // 如果是拆分类型的话就单独变成一个object
             compactedObjects.add(compactedObjectBuilder.build());
         } else {
             if (compactedStreamSetObjectBuilder == null) {
                 compactedStreamSetObjectBuilder = new CompactedObjectBuilder();
             }
-            compactedStreamSetObjectBuilder.merge(compactedObjectBuilder);
+            compactedStreamSetObjectBuilder.merge(compactedObjectBuilder); // 这里是compact类型的，尝试合并这个plan，合并之后会需要做重新定位
         }
         return compactedStreamSetObjectBuilder;
     }
@@ -276,6 +285,8 @@ public class CompactionAnalyzer {
     private List<CompactedObjectBuilder> compactObjects(List<StreamDataBlock> streamDataBlocks) {
         List<CompactedObjectBuilder> compactedObjectBuilders = new ArrayList<>();
         CompactedObjectBuilder builder = new CompactedObjectBuilder();
+
+
         for (StreamDataBlock streamDataBlock : streamDataBlocks) {
             if (builder.lastStreamId() == -1L) {
                 // init state
@@ -285,9 +296,10 @@ public class CompactionAnalyzer {
                 if (streamDataBlock.getStartOffset() > builder.lastOffset()) {
                     // data range is not continuous, split current object as StreamObject
                     builder = splitObject(builder, compactedObjectBuilders);
-                    builder.addStreamDataBlock(streamDataBlock);
+                    builder.addStreamDataBlock(streamDataBlock); // 把这个数据块儿添加到数据块儿里
+
                 } else if (streamDataBlock.getStartOffset() == builder.lastOffset()) {
-                    builder.addStreamDataBlock(streamDataBlock);
+                    builder.addStreamDataBlock(streamDataBlock); // 和之前的末尾相连
                 } else {
                     // should not go there
                     logger.error("FATAL ERROR: illegal stream range position, last offset: {}, curr: {}",
@@ -295,14 +307,19 @@ public class CompactionAnalyzer {
                     return new ArrayList<>();
                 }
             } else {
+                // 不是一个stream，如果过了切分的块儿大小
                 builder = splitAndAddBlock(builder, streamDataBlock, compactedObjectBuilders);
             }
         }
-        if (builder.currStreamBlockSize() > streamSplitSize) {
+
+
+        if (builder.currStreamBlockSize() > streamSplitSize) { // 16MB
             splitObject(builder, compactedObjectBuilders);
         } else {
             compactedObjectBuilders.add(builder);
         }
+
+
         return compactedObjectBuilders;
     }
 
@@ -314,14 +331,19 @@ public class CompactionAnalyzer {
      */
     Map<Long, List<StreamDataBlock>> filterBlocksToCompact(Map<Long, List<StreamDataBlock>> streamDataBlocksMap) {
         // group stream data blocks by stream id, key: stream id, value: ids of objects that contains this stream
+
+        // streamId -> Set<objectId>
         Map<Long, Set<Long>> streamToObjectIds = streamDataBlocksMap.values().stream()
             .flatMap(Collection::stream)
             .collect(Collectors.groupingBy(StreamDataBlock::getStreamId, Collectors.mapping(StreamDataBlock::getObjectId, Collectors.toSet())));
+
+        // 某个stream至少在两个object里的话就把这个stream所在的object给Compact了
         Set<Long> objectIdsToCompact = streamToObjectIds
             .entrySet().stream()
             .filter(e -> e.getValue().size() > 1)
             .flatMap(e -> e.getValue().stream())
             .collect(Collectors.toSet());
+
         return streamDataBlocksMap.entrySet().stream()
             .filter(e -> objectIdsToCompact.contains(e.getKey()))
             .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
@@ -330,8 +352,8 @@ public class CompactionAnalyzer {
     private CompactedObjectBuilder splitAndAddBlock(CompactedObjectBuilder builder,
         StreamDataBlock streamDataBlock,
         List<CompactedObjectBuilder> compactedObjectBuilders) {
-        if (builder.currStreamBlockSize() > streamSplitSize) {
-            builder = splitObject(builder, compactedObjectBuilders);
+        if (builder.currStreamBlockSize() > streamSplitSize) { // 16MB
+            builder = splitObject(builder, compactedObjectBuilders); // 切分出来再添加这个数据块儿
         }
         builder.addStreamDataBlock(streamDataBlock);
         return builder;
@@ -340,11 +362,12 @@ public class CompactionAnalyzer {
     private CompactedObjectBuilder splitObject(CompactedObjectBuilder builder,
         List<CompactedObjectBuilder> compactedObjectBuilders) {
         CompactedObjectBuilder splitBuilder = builder.splitCurrentStream();
+        // 把当前stream的这个范围单独切分出来，构建成一个新的builder
         splitBuilder.setType(CompactionType.SPLIT);
-        if (builder.totalBlockSize() != 0) {
+        if (builder.totalBlockSize() != 0) { // 如果切分之后还有数据块儿的话就添加过来
             compactedObjectBuilders.add(builder);
         }
-        compactedObjectBuilders.add(splitBuilder);
+        compactedObjectBuilders.add(splitBuilder); // 添加切分的数据块儿
         builder = new CompactedObjectBuilder();
         return builder;
     }

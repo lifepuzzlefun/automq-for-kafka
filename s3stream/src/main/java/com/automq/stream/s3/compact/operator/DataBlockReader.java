@@ -115,7 +115,7 @@ public class DataBlockReader {
     public void readContinuousBlocks(List<StreamDataBlock> streamDataBlocks, long maxReadBatchSize) {
         long objectId = metadata.objectId();
         if (maxReadBatchSize <= 0) {
-            readContinuousBlocks0(streamDataBlocks);
+            readContinuousBlocks0(streamDataBlocks); // 没有限制直接全读
             return;
         }
 
@@ -126,7 +126,7 @@ public class DataBlockReader {
             currentReadSize += streamDataBlocks.get(end).getBlockSize();
             if (currentReadSize >= maxReadBatchSize) {
                 final int finalStart = start;
-                if (start == end) {
+                if (start == end) { // TODO
                     // split single data block to multiple read
                     long remainBytes = streamDataBlocks.get(end).getBlockSize();
                     long startPosition = streamDataBlocks.get(end).getBlockStartPosition();
@@ -220,7 +220,7 @@ public class DataBlockReader {
             int blockSize = streamDataBlock.getBlockSize();
             ByteBuf blockBuf = buf.retainedSlice(buf.readerIndex(), blockSize);
             buf.skipBytes(blockSize);
-            streamDataBlock.getDataCf().complete(blockBuf);
+            streamDataBlock.getDataCf().complete(blockBuf); // 在这里切一块儿出来
         }
         buf.release();
     }

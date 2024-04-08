@@ -29,14 +29,15 @@ public class CompactionStats {
     }
 
     public static CompactionStats of(List<CompactedObjectBuilder> compactedObjectBuilders) {
-        int streamNumInStreamSet = 0;
-        int streamObjectNum = 0;
+        int streamNumInStreamSet = 0; // 剩余的streamSetObject 里的stream有多少个
+        int streamObjectNum = 0; // 生成的streamObject是多少个
         Map<Long, Integer> tmpObjectRecordMap = new HashMap<>();
+
+        // 统计一下最后的分配信息
         for (CompactedObjectBuilder compactedObjectBuilder : compactedObjectBuilders) {
             Set<Long> objectIdSet = compactedObjectBuilder.uniqueObjectIds();
             for (Long objectId : objectIdSet) {
-                tmpObjectRecordMap.putIfAbsent(objectId, 0);
-                tmpObjectRecordMap.put(objectId, tmpObjectRecordMap.get(objectId) + 1);
+                tmpObjectRecordMap.put(objectId, tmpObjectRecordMap.getOrDefault(objectId, 0) + 1);
             }
             if (compactedObjectBuilder.type() == CompactionType.SPLIT && !compactedObjectBuilder.streamDataBlocks().isEmpty()) {
                 streamObjectNum++;

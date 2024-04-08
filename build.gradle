@@ -61,7 +61,7 @@ ext {
   // "JEP 403: Strongly Encapsulate JDK Internals" causes some tests to fail when they try
   // to access internals (often via mocking libraries). We use `--add-opens` as a workaround
   // for now and we'll fix it properly (where possible) via KAFKA-13275.
-  if (JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_16))
+//  if (JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_16))
     defaultJvmArgs.addAll(
       "--add-opens=java.base/java.io=ALL-UNNAMED",
       "--add-opens=java.base/java.lang=ALL-UNNAMED",
@@ -73,10 +73,11 @@ ext {
       "--add-opens=java.base/java.util.stream=ALL-UNNAMED",
       "--add-opens=java.base/java.text=ALL-UNNAMED",
       "--add-opens=java.base/java.time=ALL-UNNAMED",
-      "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED"
+      "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED",
+            "-Dio.netty.tryReflectionSetAccessible=true"
     )
 
-  maxTestForks = project.hasProperty('maxParallelForks') ? maxParallelForks.toInteger() : Runtime.runtime.availableProcessors()
+  maxTestForks = project.hasProperty('maxParallelForks') ? maxParallelForks.toInteger() : 36
   maxScalacThreads = project.hasProperty('maxScalacThreads') ? maxScalacThreads.toInteger() :
       Math.min(Runtime.runtime.availableProcessors(), 8)
   userIgnoreFailures = project.hasProperty('ignoreFailures') ? ignoreFailures : false
@@ -385,7 +386,7 @@ subprojects {
   }
 
   test {
-    maxParallelForks = maxTestForks
+    maxParallelForks = 8
     ignoreFailures = userIgnoreFailures
 
     maxHeapSize = defaultMaxHeapSize
@@ -419,10 +420,26 @@ subprojects {
     description = 'Runs unit tests for Kafka on S3.'
     dependsOn compileJava
 
-    maxParallelForks = maxTestForks
+    maxParallelForks = 8
     ignoreFailures = userIgnoreFailures
 
     maxHeapSize = defaultMaxHeapSize
+
+    defaultJvmArgs.addAll(
+            "--add-opens=java.base/java.io=ALL-UNNAMED",
+            "--add-opens=java.base/java.lang=ALL-UNNAMED",
+            "--add-opens=java.base/java.nio=ALL-UNNAMED",
+            "--add-opens=java.base/java.nio.file=ALL-UNNAMED",
+            "--add-opens=java.base/java.util=ALL-UNNAMED",
+            "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
+            "--add-opens=java.base/java.util.regex=ALL-UNNAMED",
+            "--add-opens=java.base/java.util.stream=ALL-UNNAMED",
+            "--add-opens=java.base/java.text=ALL-UNNAMED",
+            "--add-opens=java.base/java.time=ALL-UNNAMED",
+            "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED",
+            "-Dio.netty.tryReflectionSetAccessible=true"
+    )
+
     jvmArgs = defaultJvmArgs
 
     testLogging {
@@ -1982,6 +1999,7 @@ project(':s3stream') {
   }
 
   dependencies {
+    implementation project(':clients')
     implementation libs.awsSdk
     implementation libs.awsSdkNetty
     implementation libs.nettyTcnativeBoringSsl

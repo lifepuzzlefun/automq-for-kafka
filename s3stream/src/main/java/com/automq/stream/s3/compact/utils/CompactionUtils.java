@@ -68,14 +68,20 @@ public class CompactionUtils {
         List<S3ObjectMetadata> objectMetadataList,
         S3Operator s3Operator,
         Logger logger) {
+
+        // 按照StreamId 做groupBy
         Map<Long, StreamMetadata> streamMetadataMap = streamMetadataList.stream()
             .collect(Collectors.toMap(StreamMetadata::streamId, s -> s));
         Map<Long, CompletableFuture<List<StreamDataBlock>>> objectStreamRangePositionFutures = new HashMap<>();
         for (S3ObjectMetadata objectMetadata : objectMetadataList) {
             DataBlockReader dataBlockReader = new DataBlockReader(objectMetadata, s3Operator);
+
+            // 读取streamObject的index块儿
             dataBlockReader.parseDataBlockIndex();
             objectStreamRangePositionFutures.put(objectMetadata.objectId(), dataBlockReader.getDataBlockIndex());
         }
+
+        //
         return objectStreamRangePositionFutures.entrySet().stream()
             .map(f -> {
                 try {
@@ -114,10 +120,14 @@ public class CompactionUtils {
      */
     public static List<StreamDataBlock> sortStreamRangePositions(Map<Long, List<StreamDataBlock>> streamDataBlocksMap) {
         //TODO: use merge sort
+
+        // streamId -> 全部的block的块儿，
         Map<Long, List<StreamDataBlock>> sortedStreamObjectMap = new TreeMap<>();
         for (List<StreamDataBlock> streamDataBlocks : streamDataBlocksMap.values()) {
             streamDataBlocks.forEach(e -> sortedStreamObjectMap.computeIfAbsent(e.getStreamId(), k -> new ArrayList<>()).add(e));
         }
+
+        // 按照stream排序之后，按照block的startOffset排序
         return sortedStreamObjectMap.values().stream().flatMap(list -> {
             list.sort(StreamDataBlock.STREAM_OFFSET_COMPARATOR);
             return list.stream();

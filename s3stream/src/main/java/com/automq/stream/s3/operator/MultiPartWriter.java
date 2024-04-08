@@ -101,7 +101,7 @@ public class MultiPartWriter implements Writer {
     public void copyWrite(String sourcePath, long start, long end) {
         long nextStart = start;
         for (; ; ) {
-            long currentEnd = Math.min(nextStart + Writer.MAX_PART_SIZE, end);
+            long currentEnd = Math.min(nextStart + Writer.MAX_PART_SIZE, end); // 最大一个part是5gb
             copyWrite0(sourcePath, nextStart, currentEnd);
             nextStart = currentEnd;
             if (currentEnd == end) {
@@ -113,18 +113,18 @@ public class MultiPartWriter implements Writer {
     public void copyWrite0(String sourcePath, long start, long end) {
         long targetSize = end - start;
         if (objectPart == null) {
-            if (targetSize < minPartSize) {
+            if (targetSize < minPartSize) { // 5mb, 主要是这里没办法确定是否是最后一个part？
                 this.objectPart = new ObjectPart(throttleStrategy);
-                objectPart.readAndWrite(sourcePath, start, end);
+                objectPart.readAndWrite(sourcePath, start, end); // 弄好之后塞到这个buffer里了
             } else {
-                new CopyObjectPart(sourcePath, start, end);
+                new CopyObjectPart(sourcePath, start, end); // 可能一般都走这里了？
             }
         } else {
-            if (objectPart.size() + targetSize > MAX_MERGE_WRITE_SIZE) {
+            if (objectPart.size() + targetSize > MAX_MERGE_WRITE_SIZE) { // 大于16MB ？
                 long readAndWriteCopyEnd = start + minPartSize - objectPart.size();
                 objectPart.readAndWrite(sourcePath, start, readAndWriteCopyEnd);
-                objectPart.upload();
-                this.objectPart = null;
+                objectPart.upload(); // 超过大小的话就upload
+                this.objectPart = null; // 这里把之前的part填充了，之后用objectCopy上传剩下的
                 new CopyObjectPart(sourcePath, readAndWriteCopyEnd, end);
             } else {
                 objectPart.readAndWrite(sourcePath, start, end);
