@@ -76,6 +76,11 @@ public class StreamMetadataManager implements InRangeObjectsFetcher, MetadataPub
 
     @Override
     public void onMetadataUpdate(MetadataDelta delta, MetadataImage newImage, LoaderManifest manifest) {
+        try {
+            Thread.sleep(30);
+        } catch (InterruptedException e) {
+            //
+        }
         synchronized (this) {
             if (newImage.highestOffsetAndEpoch().equals(this.metadataImage.highestOffsetAndEpoch())) {
                 return;

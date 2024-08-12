@@ -26,17 +26,10 @@ import com.automq.stream.s3.metadata.StreamOffsetRange;
 import io.netty.buffer.ByteBuf;
 import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.ReferenceCounted;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.Set;
+
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.metadata.AssignedStreamIdRecord;
@@ -153,6 +146,8 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
         try {
             getObjects0(ctx);
         } catch (Throwable e) {
+            LOGGER.error("error when get Objects0 streamId {} startOffset {} endOffset {}, limit {}",
+                streamId, startOffset, endOffset, limit, e);
             ctx.cf.completeExceptionally(e);
         }
         return ctx.cf;
@@ -265,7 +260,19 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
             final int streamSetObjectsSize = streamSetObjects.size();
             for (; streamSetObjectIndex < streamSetObjectsSize; streamSetObjectIndex++) {
                 S3StreamSetObject streamSetObject = streamSetObjects.get(streamSetObjectIndex);
-                StreamOffsetRange streamOffsetRange = findStreamInStreamSetObject(ctx, streamSetObject).orElse(null);
+                StreamOffsetRange streamOffsetRange = null;
+                try {
+                    streamOffsetRange = findStreamInStreamSetObject(ctx, streamSetObject).orElse(null);
+                } catch (Exception e) {
+                    LOGGER.error("error when find stream in stream set object object2range{} streamId{} debugContext{} startOffset{} nextStartOffset{} endOffset{} limit{} cf{}",
+                        ctx.object2range, ctx.streamId, ctx.debugContext, ctx.startOffset, ctx.nextStartOffset, ctx.endOffset, ctx.limit, ctx.cf, e);
+                    LOGGER.error("error when find stream in stream set object current image epoch {}, live epoch {}, known endOffset {}, not found ssoInfo {} nodeImage orderList {}, streamMetadataMap {}" +
+                            "load {} put {}",
+                        this.registryRef.epoch(), this.registryRef.getLiveEpochs(),this.streamEndOffsets.get(ctx.streamId), streamSetObject, node.orderList(), this.streamMetadataMap.entrySet(),
+                        ctx.load, ctx.getRangeFinish);
+                    throw e;
+                }
+
                 // skip the stream set object not containing the stream or the range is before the nextStartOffset
                 if (streamOffsetRange == null || streamOffsetRange.endOffset() <= nextStartOffset) {
                     continue;
@@ -427,10 +434,15 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
             if (ctx.object2range.containsKey(streamSetObject.objectId())) {
                 continue;
             }
+
+            ctx.recordLoadStreamSetObjectInfo(streamSetObject.objectId(), ctx.streamId);
             loadIndexCfList.add(
                 ctx.rangeGetter
                     .find(streamSetObject.objectId(), ctx.streamId)
-                    .thenAccept(range -> ctx.object2range.put(streamSetObject.objectId(), range))
+                    .thenAccept(range -> {
+                        ctx.recordGetRangeFinish(streamSetObject.objectId(),range);
+                        ctx.object2range.put(streamSetObject.objectId(), range);
+                    })
             );
         }
         if (loadIndexCfList.isEmpty()) {
@@ -648,6 +660,17 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
                     streamId, startOffset, endOffset, limit, debugContext);
                 Runtime.getRuntime().halt(1);
             }
+        }
+
+        private ConcurrentHashMap<AbstractMap.SimpleEntry<Long,Long>, AbstractMap.SimpleEntry<Long, Optional<StreamOffsetRange>>> getRangeFinish = new ConcurrentHashMap<>();
+
+        public void recordGetRangeFinish(long objectId, Optional<StreamOffsetRange> range) {
+            getRangeFinish.put(new AbstractMap.SimpleEntry<>(System.nanoTime(), objectId), new AbstractMap.SimpleEntry<>(objectId, range));
+        }
+
+        private ConcurrentHashMap<AbstractMap.SimpleEntry<Long, Long> , AbstractMap.SimpleEntry<Long, Long>> load = new ConcurrentHashMap<>();
+        public void recordLoadStreamSetObjectInfo(long objectId, long streamId) {
+            load.put(new AbstractMap.SimpleEntry<>(System.nanoTime(), objectId), new AbstractMap.SimpleEntry<>(objectId, streamId));
         }
     }
 

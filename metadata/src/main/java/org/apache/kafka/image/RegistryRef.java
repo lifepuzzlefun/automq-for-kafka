@@ -14,6 +14,7 @@ package org.apache.kafka.image;
 import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.ReferenceCounted;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
 import org.apache.kafka.common.utils.LogContext;
@@ -125,5 +126,11 @@ public class RegistryRef extends AbstractReferenceCounted {
         synchronized (registry) {
             return task.get();
         }
+    }
+
+    public List<Long> getLiveEpochs() {
+        return inLock(() -> {
+            return Collections.unmodifiableList(this.liveEpochs);
+        });
     }
 }
